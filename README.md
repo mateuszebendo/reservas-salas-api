@@ -189,26 +189,124 @@ Uma feature nunca usa código de outra. O que é compartilhado mora em `Domain`,
 
 ## Análise de complexidade
 
-<!--
-Responda com as suas palavras, nesta ordem:
-
-1. Qual é a consulta que verifica conflito de horário?
-2. Qual índice ela usa, e por que as colunas estão nessa ordem?
-3. Onde entra o limite de 4 horas? Sem ele, o que a consulta acabaria percorrendo?
-4. Qual é o custo da consulta? O que são n e k neste sistema?
-5. Qual é a evidência? Mostre o resultado do EXPLAIN QUERY PLAN e o tempo medido
-   com 100 mil reservas numa sala, e explique como alguém pode repetir o teste.
-6. O que acontece se a duração máxima diminuir no futuro?
--->
-
 ### A consulta
+
+Antes de gravar uma reserva, a API pergunta ao banco se existe alguma reserva ativa da mesma sala que bate com o horário pedido. Em `CriarReservaEndpoint`, isso vira (já traduzido para SQL):
+
+```sql
+SELECT EXISTS (
+  SELECT 1 FROM Reservas r
+  WHERE r.SalaId = @sala
+    AND NOT r.Cancelada
+    AND r.Inicio >= @inicio - 4h   -- limite de duração máxima
+    AND r.Inicio <  @fim
+    AND r.Fim    >  @inicio
+)
+```
+
+Duas reservas se sobrepõem quando cada uma começa antes de a outra terminar: `existente.Inicio < novo.Fim` e `existente.Fim > novo.Inicio`. Os dois `<`/`>` estritos são o que deixa as reservas encostadas passarem (uma que termina às 11h não conflita com outra que começa às 11h). O `EXISTS` para na primeira linha encontrada, então a consulta nunca traz dados, só responde sim ou não.
 
 ### O índice
 
+```
+IX_Reserva_IntervaloPorSala (SalaId, Inicio, Fim)
+```
+
+A ordem segue o que o banco consegue aproveitar de um índice composto: ele usa as colunas da esquerda para a direita, e só consegue "pular direto" para um trecho enquanto as condições forem de igualdade ou de uma única faixa.
+
+- `SalaId` vem primeiro porque é uma igualdade. Ela leva direto ao pedaço do índice que só tem reservas daquela sala, e as outras 11 salas nem são tocadas.
+- `Inicio` vem em segundo porque é a coluna da faixa (`>=` e `<`). Dentro da sala, as reservas já estão ordenadas por início, então a faixa é um trecho contínuo.
+- `Fim` vem por último. Depois de uma faixa em `Inicio`, o banco não consegue mais usar `Fim` para navegar, mas como a coluna está no índice ele confere `Fim > @inicio` em cada entrada da faixa sem precisar ler a linha da tabela.
+
+`Cancelada` não está no índice, então só as entradas que passam no teste de `Fim` vão buscar a linha na tabela para checar se ela foi cancelada.
+
 ### O papel do limite de 4 horas
+
+O índice só consegue limitar a busca por `Inicio`, e `Fim > @inicio` é só um filtro. Sem outro limite inferior em `Inicio`, a faixa seria `Inicio < @fim`: tudo o que a sala já teve desde o primeiro dia até o horário pedido. O banco percorreria todo esse histórico, entrada por entrada, para descobrir se alguma delas termina depois de `@inicio`.
+
+A regra de negócio resolve isso. Como nenhuma reserva dura mais de 4 horas, uma reserva que começou antes de `@inicio - 4h` já terminou antes de `@inicio` e não tem como conflitar. Por isso a consulta acrescenta `Inicio >= @inicio - 4h`, e a faixa passa a cobrir no máximo uma janela de 8 horas (4 antes do início pedido, mais a duração pedida, que também é de até 4 horas), qualquer que seja o tamanho do histórico.
+
+Esse limite não muda o resultado da consulta, só diz ao banco onde não precisa olhar. O valor vem de `Reserva.TempoMaximo`, a mesma constante que valida a duração, então os dois não se desencontram.
 
 ### Custo
 
+- **n** = quantidade de reservas guardadas (todas as salas, ativas e canceladas).
+- **k** = quantidade de reservas da sala dentro da janela `[@inicio - 4h, @fim)`.
+
+O custo da consulta é **O(log n + k)**: `log n` para descer na árvore do índice até o começo da janela, e `k` para percorrer as entradas dela.
+
+Na prática `k` é minúsculo e não cresce com a idade do sistema. Reservas ativas da mesma sala não se sobrepõem e duram pelo menos 15 minutos, então cabem poucas dezenas numa janela de 8 horas. As canceladas também aparecem na faixa (o índice não as exclui), mas só dentro dessa mesma janela. Com `k` limitado, o custo real é praticamente **O(log n)**.
+
+Sem o limite de 4 horas o custo seria **O(log n + m)**, onde `m` é o número de reservas da sala até aquele horário, e `m` só aumenta com o tempo. Cada reserva nova deixaria a próxima verificação mais lenta.
+
 ### Evidência e como reproduzir
 
+Plano de execução do SQLite (`EXPLAIN QUERY PLAN`) para as duas versões da consulta, numa sala com 100 mil reservas:
+
+```
+Com o limite de 4 horas:
+SEARCH r USING INDEX IX_Reserva_IntervaloPorSala (SalaId=? AND Inicio>? AND Inicio<?)
+
+Sem o limite:
+SEARCH r USING INDEX IX_Reserva_IntervaloPorSala (SalaId=? AND Inicio<?)
+```
+
+As duas usam o índice, mas a primeira tem faixa fechada nos dois lados e a segunda só tem o teto. É essa diferença que aparece no tempo. Medição com 100 mil reservas na mesma sala (uma a cada 2 horas, 10% canceladas), consultando um horário depois de todas as reservas existentes, que é o pior caso para a versão sem limite:
+
+| Consulta | Mediana |
+|---|---|
+| Com o limite de 4 horas | 0,004 ms |
+| Sem o limite | 8 ms |
+
+Cerca de 1.800 vezes mais rápido. Os valores absolutos mudam de máquina para máquina; o que importa é a proporção, e que a primeira não depende do tamanho do histórico.
+
+Para repetir, salve o script abaixo como `benchmark.py` fora da pasta do projeto e rode com `python3 benchmark.py`. Ele só precisa do Python, cria o próprio banco `bench.db` com a mesma tabela e o mesmo índice das migrations, e não mexe no `app.db`.
+
+```python
+import sqlite3, time, datetime as dt, statistics, os
+
+if os.path.exists("bench.db"):
+    os.remove("bench.db")
+c = sqlite3.connect("bench.db")
+c.executescript("""
+CREATE TABLE Reservas (
+  ReservaId INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, SalaId INTEGER NOT NULL,
+  Responsavel TEXT NOT NULL, Inicio TEXT NOT NULL, Fim TEXT NOT NULL,
+  NumeroParticipantes INTEGER NOT NULL, Cancelada INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IX_Reserva_IntervaloPorSala ON Reservas (SalaId, Inicio, Fim);""")
+
+f = lambda d: d.strftime("%Y-%m-%d %H:%M:%S")
+h = lambda n: dt.timedelta(hours=n)
+base, N = dt.datetime(2027, 1, 1, 8), 100_000
+c.executemany(
+    "INSERT INTO Reservas(SalaId,Responsavel,Inicio,Fim,NumeroParticipantes,Cancelada) VALUES (?,?,?,?,?,?)",
+    [(1, "x", f(base + h(2*i)), f(base + h(2*i + 1)), 3, int(i % 10 == 0)) for i in range(N)])
+c.commit()
+c.execute("ANALYZE")
+
+COM = "SELECT EXISTS (SELECT 1 FROM Reservas WHERE SalaId=? AND NOT Cancelada AND Inicio>=? AND Inicio<? AND Fim>?)"
+SEM = "SELECT EXISTS (SELECT 1 FROM Reservas WHERE SalaId=? AND NOT Cancelada AND Inicio<? AND Fim>?)"
+ini = base + h(2*N + 1)   # depois de todas as reservas
+fim = ini + h(1)
+a_com = (1, f(ini - h(4)), f(fim), f(ini))
+a_sem = (1, f(fim), f(ini))
+
+for nome, q, a in (("com limite", COM, a_com), ("sem limite", SEM, a_sem)):
+    print(nome, [r[3] for r in c.execute("EXPLAIN QUERY PLAN " + q, a)][-1])
+    tempos = []
+    for _ in range(200):
+        t0 = time.perf_counter()
+        c.execute(q, a).fetchone()
+        tempos.append((time.perf_counter() - t0) * 1000)
+    print(f"  mediana: {statistics.median(tempos):.4f} ms")
+```
+
+Para conferir o plano no banco real da API (`app.db`), com o SQLite instalado: `sqlite3 app.db "EXPLAIN QUERY PLAN SELECT 1 FROM Reservas WHERE SalaId=1 AND Inicio>='2027-03-01 06:00:00' AND Inicio<'2027-03-01 11:00:00' AND Fim>'2027-03-01 10:00:00'"`.
+
 ### Cuidado se a regra mudar
+
+A consulta só está correta enquanto a janela de busca for pelo menos tão grande quanto a duração máxima de uma reserva. O `4h` da consulta vem de `Reserva.TempoMaximo`, então:
+
+- **Se a duração máxima diminuir** (por exemplo, para 2 horas), a janela encolhe junto e a consulta fica ainda mais rápida, mas as reservas que já existem no banco com mais de 2 horas continuam valendo. Uma reserva de 4 horas que começou 3 horas antes do novo pedido ficaria fora da janela de 2 horas, e o conflito passaria sem aviso. Antes de reduzir, é preciso decidir o que fazer com as reservas longas já feitas, ou manter o valor antigo na consulta enquanto elas existirem.
+- **Se a duração máxima aumentar**, a janela cresce junto e nada quebra, só ficam um pouco mais entradas para percorrer.
+- **Se alguém trocar o valor da consulta sem mexer na regra** (ou o contrário), ela passa a deixar conflitos reais passarem. Por isso as duas coisas usam a mesma constante, e qualquer mudança deve ser feita nela.
