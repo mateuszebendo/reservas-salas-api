@@ -1,0 +1,104 @@
+@Reservas_HostAddress = http://localhost:5192
+
+### ==================== SALAS ====================
+
+### Cadastrar sala
+POST {{Reservas_HostAddress}}/salas
+Content-Type: application/json
+
+{
+  "nome": "Sala Alfa",
+  "andar": "1",
+  "capacidade": 10
+}
+
+### Listar salas
+GET {{Reservas_HostAddress}}/salas
+Accept: application/json
+
+### Obter sala por id
+GET {{Reservas_HostAddress}}/salas/1
+Accept: application/json
+
+### Obter sala inexistente (404)
+GET {{Reservas_HostAddress}}/salas/9999
+Accept: application/json
+
+### Desativar sala
+PATCH {{Reservas_HostAddress}}/salas/1/desativar
+
+### ==================== RESERVAS ====================
+
+### Criar reserva
+POST {{Reservas_HostAddress}}/reservas
+Content-Type: application/json
+
+{
+  "salaId": 1,
+  "responsavel": "Maria Silva",
+  "inicio": "2027-03-01T10:00:00",
+  "fim": "2027-03-01T11:00:00",
+  "numeroParticipantes": 5
+}
+
+### Criar reserva em conflito de horario (409)
+POST {{Reservas_HostAddress}}/reservas
+Content-Type: application/json
+
+{
+  "salaId": 1,
+  "responsavel": "Joao Souza",
+  "inicio": "2027-03-01T10:30:00",
+  "fim": "2027-03-01T11:30:00",
+  "numeroParticipantes": 3
+}
+
+### Criar reserva com participantes acima da capacidade
+POST {{Reservas_HostAddress}}/reservas
+Content-Type: application/json
+
+{
+  "salaId": 1,
+  "responsavel": "Ana Lima",
+  "inicio": "2027-03-02T10:00:00",
+  "fim": "2027-03-02T11:00:00",
+  "numeroParticipantes": 999
+}
+
+### Obter reserva por id
+GET {{Reservas_HostAddress}}/reservas/1
+Accept: application/json
+
+### Listar reservas (paginacao padrao)
+GET {{Reservas_HostAddress}}/reservas
+Accept: application/json
+
+### Listar reservas com paginacao
+GET {{Reservas_HostAddress}}/reservas?pagina=1&tamanho=5
+Accept: application/json
+
+### Listar reservas por sala
+GET {{Reservas_HostAddress}}/reservas?salaId=1
+Accept: application/json
+
+### Listar reservas por periodo (ate so com data = dia inteiro incluido)
+GET {{Reservas_HostAddress}}/reservas?de=2027-03-01&ate=2027-03-01
+Accept: application/json
+
+### Listar reservas por periodo (ate com hora = inclusivo)
+GET {{Reservas_HostAddress}}/reservas?de=2027-03-01T00:00:00&ate=2027-03-01T10:00:00
+Accept: application/json
+
+### Listar reservas com tamanho invalido (400)
+GET {{Reservas_HostAddress}}/reservas?tamanho=100
+Accept: application/json
+
+### Listar reservas com pagina invalida (400)
+GET {{Reservas_HostAddress}}/reservas?pagina=0
+Accept: application/json
+
+### Cancelar reserva
+PATCH {{Reservas_HostAddress}}/reservas/1/cancelar
+
+### Cancelar reserva inexistente (404)
+PATCH {{Reservas_HostAddress}}/reservas/9999/cancelar
