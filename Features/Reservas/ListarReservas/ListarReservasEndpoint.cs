@@ -38,7 +38,7 @@ public static class ListarReservasEndpoint
                 reserva.Responsavel,
                 reserva.Inicio,
                 reserva.Fim,
-                reserva.NumeroParticipantes, 
+                reserva.NumeroParticipantes,
                 reserva.Cancelada
             ))
             .ToListAsync(cancellationToken);
