@@ -1,0 +1,13 @@
+# Saída de build
+bin/
+obj/
+
+# Banco SQLite local
+*.db
+*.db-shm
+*.db-wal
+
+# IDEs
+.vs/
+.vscode/
+*.user
